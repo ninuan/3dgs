@@ -50,7 +50,7 @@ class GaussianModel:
     def __init__(self, sh_degree, optimizer_type="default"):
         self.active_sh_degree = 0
         self.optimizer_type = optimizer_type
-        self.max_sh_degree = sh_degree  
+        self.max_sh_degree = sh_degree
         self._xyz = torch.empty(0)
         self._features_dc = torch.empty(0)
         self._features_rest = torch.empty(0)
@@ -63,6 +63,13 @@ class GaussianModel:
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+
+        # 可学习的坐标变换参数 (用于对齐点云和相机坐标系)
+        self._transform_rotation = None  # 旋转 (quaternion or rotation matrix)
+        self._transform_translation = None  # 平移
+        self._transform_scale = None  # 缩放 (optional)
+        self.transform_optimizer = None
+
         self.setup_functions()
 
     def capture(self):
@@ -109,7 +116,39 @@ class GaussianModel:
     
     @property
     def get_xyz(self):
+        """获取坐标（应用变换后）"""
+        if self._transform_rotation is not None and self._transform_translation is not None:
+            # 应用可学习的坐标变换
+            return self.apply_coordinate_transform(self._xyz)
         return self._xyz
+
+    def apply_coordinate_transform(self, xyz):
+        """应用坐标变换: xyz_new = s * R @ xyz + t"""
+        # 将四元数转换为旋转矩阵
+        quat = self._transform_rotation / torch.norm(self._transform_rotation)  # 手动归一化
+        w, x, y, z = quat[0], quat[1], quat[2], quat[3]
+
+        # 四元数转旋转矩阵
+        R = torch.zeros((3, 3), device=xyz.device)
+        R[0, 0] = 1 - 2*(y**2 + z**2)
+        R[0, 1] = 2*(x*y - w*z)
+        R[0, 2] = 2*(x*z + w*y)
+        R[1, 0] = 2*(x*y + w*z)
+        R[1, 1] = 1 - 2*(x**2 + z**2)
+        R[1, 2] = 2*(y*z - w*x)
+        R[2, 0] = 2*(x*z - w*y)
+        R[2, 1] = 2*(y*z + w*x)
+        R[2, 2] = 1 - 2*(x**2 + y**2)
+
+        # 应用变换
+        xyz_transformed = xyz @ R.T + self._transform_translation.unsqueeze(0)
+
+        # 如果有缩放参数
+        if self._transform_scale is not None:
+            scale = torch.exp(self._transform_scale)  # 确保正值
+            xyz_transformed = xyz_transformed * scale
+
+        return xyz_transformed
     
     @property
     def get_features(self):
@@ -176,6 +215,14 @@ class GaussianModel:
         exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)
         self._exposure = nn.Parameter(exposure.requires_grad_(True))
 
+        # 初始化可学习的坐标变换参数
+        # 旋转: 初始化为单位四元数 [w=1, x=0, y=0, z=0]
+        self._transform_rotation = nn.Parameter(torch.tensor([1.0, 0.0, 0.0, 0.0], device="cuda").requires_grad_(True))
+        # 平移: 初始化为零向量
+        self._transform_translation = nn.Parameter(torch.zeros(3, device="cuda").requires_grad_(True))
+        # 缩放: 初始化为0 (exp(0)=1，即不缩放)
+        self._transform_scale = nn.Parameter(torch.tensor(0.0, device="cuda").requires_grad_(True))
+
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -202,11 +249,27 @@ class GaussianModel:
         # 曝光优化器
         self.exposure_optimizer = torch.optim.Adam([self._exposure])
 
+        # 坐标变换优化器 (如果启用)
+        if self._transform_rotation is not None:
+            transform_params = [
+                {'params': [self._transform_rotation], 'lr': 0.001, 'name': 'transform_rotation'},
+                {'params': [self._transform_translation], 'lr': 0.01, 'name': 'transform_translation'},
+            ]
+            if self._transform_scale is not None:
+                transform_params.append({'params': [self._transform_scale], 'lr': 0.001, 'name': 'transform_scale'})
+
+            self.transform_optimizer = torch.optim.Adam(transform_params, lr=0.0, eps=1e-15)
+            print("[Coordinate Transform] Learnable transformation parameters initialized")
+            print(f"  Rotation (quaternion): {self._transform_rotation.data.cpu().numpy()}")
+            print(f"  Translation: {self._transform_translation.data.cpu().numpy()}")
+            if self._transform_scale is not None:
+                print(f"  Scale (log): {self._transform_scale.data.cpu().numpy()}")
+
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=training_args.position_lr_max_steps)
-        
+
         self.exposure_scheduler_args = get_expon_lr_func(training_args.exposure_lr_init, training_args.exposure_lr_final,
                                                         lr_delay_steps=training_args.exposure_lr_delay_steps,
                                                         lr_delay_mult=training_args.exposure_lr_delay_mult,
@@ -434,12 +497,16 @@ class GaussianModel:
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
 
-    def densify_and_clone(self, grads, grad_threshold, scene_extent):
+    def densify_and_clone(self, grads, grad_threshold, scene_extent, valid_region_mask=None):
         # Extract points that satisfy the gradient condition
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
-        
+
+        # 添加mask约束：只克隆在有效区域内的点
+        if valid_region_mask is not None:
+            selected_pts_mask = torch.logical_and(selected_pts_mask, valid_region_mask)
+
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
         new_features_rest = self._features_rest[selected_pts_mask]
@@ -451,12 +518,16 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii, valid_region_mask=None):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
         self.tmp_radii = radii
-        self.densify_and_clone(grads, max_grad, extent)
+
+        # 记录densification前的点数，用于后续mask约束
+        num_points_before = self.get_xyz.shape[0]
+
+        self.densify_and_clone(grads, max_grad, extent, valid_region_mask)
         self.densify_and_split(grads, max_grad, extent)
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
@@ -464,6 +535,30 @@ class GaussianModel:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+
+        # 添加mask约束：裁剪不在有效区域的点
+        # 注意：densify_and_clone和densify_and_split会增加点数，
+        # 需要为新增的点也计算mask约束
+        if valid_region_mask is not None:
+            # 当前点数
+            num_points_now = self.get_xyz.shape[0]
+
+            # 如果点数增加了，需要为新点重新计算mask约束
+            if num_points_now > num_points_before:
+                # 为新点创建mask（新增的点继承自在mask内的点，所以默认标记为有效）
+                # 但为了安全，我们对所有点重新计算mask
+                # 这里简化处理：扩展valid_region_mask以匹配新的点数
+                extended_mask = torch.zeros(num_points_now, dtype=torch.bool, device="cuda")
+                extended_mask[:num_points_before] = valid_region_mask
+                # 新增的点默认标记为有效（因为它们是从有效点克隆/分裂出来的）
+                extended_mask[num_points_before:] = True
+
+                outside_mask = ~extended_mask
+            else:
+                outside_mask = ~valid_region_mask
+
+            prune_mask = torch.logical_or(prune_mask, outside_mask)
+
         self.prune_points(prune_mask)
         tmp_radii = self.tmp_radii
         self.tmp_radii = None

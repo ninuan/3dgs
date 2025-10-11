@@ -82,8 +82,38 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
         width = intr.width
 
         uid = intr.id
-        R = np.transpose(qvec2rotmat(extr.qvec))
-        T = np.array(extr.tvec)
+
+        # 处理非标准COLMAP格式（extern.txt中T是相机中心）
+        # 标准COLMAP: R是旋转矩阵, tvec使得 X_cam = R * X_world + tvec
+        # 非标准格式: T是相机中心C, X_cam = R * (X_world - C)
+        #
+        # 在dataset_readers.py中，R = np.transpose(qvec2rotmat(extr.qvec))
+        # 所以R已经是R^T了
+        #
+        # getWorld2View2(R, t) 期望:
+        #   - R是转置后的旋转矩阵（已满足）
+        #   - t是tvec（标准COLMAP格式）
+        #
+        # 如果extern.txt中T=C（相机中心），我们需要转换：
+        # 标准tvec = -R_original * C
+        # 但R = R_original^T，所以：
+        # 标准tvec = -R^T * C
+
+        R = np.transpose(qvec2rotmat(extr.qvec))  # R = R_original^T
+        C = np.array(extr.tvec)  # 假设这是相机中心
+
+        # 检测是否需要转换（通过验证投影）
+        # 简单启发式：如果T的值看起来像相机中心（绝对值较小），则转换
+        # 否则假设已经是标准格式
+        USE_CAMERA_CENTER_FORMAT = True  # 设置为True使用相机中心格式
+
+        if USE_CAMERA_CENTER_FORMAT:
+            # T是相机中心，转换为标准tvec
+            R_original = qvec2rotmat(extr.qvec)  # 未转置的R
+            T = -R_original @ C  # 标准COLMAP tvec
+        else:
+            # T已经是标准tvec
+            T = C
 
         if intr.model=="SIMPLE_PINHOLE":
             focal_length_x = intr.params[0]

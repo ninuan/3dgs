@@ -11,12 +11,14 @@
 
 import os
 import torch
+import numpy as np
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state, get_expon_lr_func
+from utils.mask_utils import compute_mask_constraint
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
@@ -164,7 +166,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
 
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"})
+                postfix_dict = {"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"}
+
+                # 添加坐标变换参数的监控 (每100次显示一次)
+                if gaussians.transform_optimizer is not None and iteration % 100 == 0:
+                    t = gaussians._transform_translation.data.cpu().numpy()
+                    postfix_dict["T"] = f"[{t[0]:.3f},{t[1]:.3f},{t[2]:.3f}]"
+
+                progress_bar.set_postfix(postfix_dict)
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
@@ -183,8 +192,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
-                
+
+                    # 计算mask约束：判断每个Gaussian点是否在至少一个视图的mask内
+                    # 注意：如果使用了可学习的坐标变换，完全禁用mask constraint
+                    # 因为：1) 坐标变换需要时间学习收敛
+                    #      2) 即使变换收敛，原始点云中仍有很多点不在mask内（但它们是椅子的一部分）
+                    #      3) 深度loss已经提供了足够的监督，不需要mask constraint
+                    valid_region_mask = None
+                    if dataset.depth_mask_dir != "" and gaussians.transform_optimizer is None:
+                        # 只有在没有坐标变换时才使用mask约束
+                        valid_region_mask = compute_mask_constraint(gaussians, scene, render, pipe, background)
+
+                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii, valid_region_mask)
+
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
@@ -192,6 +212,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration < opt.iterations:
                 gaussians.exposure_optimizer.step()
                 gaussians.exposure_optimizer.zero_grad(set_to_none = True)
+
+                # 坐标变换优化器
+                if gaussians.transform_optimizer is not None:
+                    gaussians.transform_optimizer.step()
+                    gaussians.transform_optimizer.zero_grad(set_to_none=True)
+
                 if use_sparse_adam:
                     visible = radii > 0
                     gaussians.optimizer.step(visible, radii.shape[0])
@@ -203,6 +229,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+
+    # 训练结束后打印学习到的坐标变换参数
+    if gaussians.transform_optimizer is not None:
+        print("\n" + "="*70)
+        print("Learned Coordinate Transformation:")
+        print("="*70)
+        quat = gaussians._transform_rotation.data.cpu().numpy()
+        trans = gaussians._transform_translation.data.cpu().numpy()
+        print(f"  Rotation (quaternion): [{quat[0]:.4f}, {quat[1]:.4f}, {quat[2]:.4f}, {quat[3]:.4f}]")
+        print(f"  Translation: [{trans[0]:.4f}, {trans[1]:.4f}, {trans[2]:.4f}]")
+        if gaussians._transform_scale is not None:
+            scale_log = gaussians._transform_scale.data.cpu().item()
+            scale = np.exp(scale_log)
+            print(f"  Scale: {scale:.4f} (log: {scale_log:.4f})")
+        print("="*70)
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
