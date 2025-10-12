@@ -137,6 +137,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Depth regularization
         Ll1depth_pure = 0.0
         if depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
+            # 注意：渲染器返回的是 inverse depth（逆深度），不是 depth
+            # CUDA代码中：expected_invdepth += (1 / depths[j]) * alpha * T
             invDepth = render_pkg["depth"]
             mono_invdepth = viewpoint_cam.invdepthmap.cuda()
             depth_mask = viewpoint_cam.depth_mask.cuda().clamp(0.0, 1.0)

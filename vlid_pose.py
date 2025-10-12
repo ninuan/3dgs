@@ -37,7 +37,7 @@ def improved_depth_filter(depth_threshold=0.5, remove_far_points=True, supplemen
         np.asarray(ply_init.elements[0]['blue'])
     ], axis=1)
 
-    print(f"\n原始点云: {len(xyz_init)} 个点")
+    print(f"\n初始化点云: {len(xyz_init)} 个点")
     print(f"  X: [{xyz_init[:, 0].min():.3f}, {xyz_init[:, 0].max():.3f}]")
     print(f"  Y: [{xyz_init[:, 1].min():.3f}, {xyz_init[:, 1].max():.3f}]")
     print(f"  Z: [{xyz_init[:, 2].min():.3f}, {xyz_init[:, 2].max():.3f}]")
@@ -84,14 +84,14 @@ def improved_depth_filter(depth_threshold=0.5, remove_far_points=True, supplemen
         depth_gt = depth_gt.astype(np.float32) / 1000.0  # mm -> m
 
         # 构建相机矩阵
-        R = qvec2rotmat(extr.qvec)
-        C = np.array(extr.tvec)
+        R = qvec2rotmat(extr.qvec).T
+        C = -np.dot(R, np.array(extr.tvec))
 
         # X_cam = R * (X_world - C)
-        xyz_cam = (R @ (xyz_init - C).T).T
+        # xyz_cam = (R @ (xyz_init - C).T).T
 
         # 在相机前方
-        in_front = xyz_cam[:, 2] > 0.01
+        # in_front = xyz_cam[:, 2] > 0.01
 
         # 投影到图像
         xyz_cam_valid = xyz_cam[in_front]

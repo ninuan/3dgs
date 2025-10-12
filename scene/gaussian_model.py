@@ -522,6 +522,10 @@ class GaussianModel:
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
+        # Debug: print gradient statistics
+        print(f"[Densify] Grad stats: mean={grads.mean().item():.6f}, max={grads.max().item():.6f}, "
+              f">threshold={( grads >= max_grad).sum().item()}/{grads.shape[0]}, threshold={max_grad}")
+
         self.tmp_radii = radii
 
         # 记录densification前的点数，用于后续mask约束
@@ -566,5 +570,37 @@ class GaussianModel:
         torch.cuda.empty_cache()
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
-        self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
-        self.denom[update_filter] += 1
+        # 对于深度监督训练，混合使用3D梯度和2D screenspace梯度
+        #
+        # 梯度流动分析：
+        # - 深度loss会产生screenspace梯度：depth → dL_dalpha → dL_dG → dL_dmean2D
+        # - 同时也产生3D位置梯度：depth → dL_dtz → dL_dmeans3D
+        #
+        # 两种梯度的特性：
+        # - 3D梯度：提供全局定位信号，但缺乏2D空间约束（可能导致点云发散）
+        # - 2D梯度：提供图像平面约束，将点集中在可见区域（防止发散）
+        #
+        # 策略：混合使用两种梯度，取其长处
+        # - 3D梯度用于深度对齐（放大100x以达到densification阈值）
+        # - 2D梯度用于空间约束（放大50x，保持相对权重较低）
+
+        has_grad = False
+
+        # 方案1：优先使用3D梯度（如果可用）
+        if self._xyz.grad is not None:
+            # 3D位置梯度：深度对齐信号
+            grad_3d = torch.norm(self._xyz.grad[update_filter], dim=-1, keepdim=True)
+            self.xyz_gradient_accum[update_filter] += grad_3d * 100.0
+            has_grad = True
+
+        # 方案2：叠加2D screenspace梯度（如果可用）
+        if viewspace_point_tensor.grad is not None:
+            # 2D screenspace梯度：空间约束信号
+            # 注意：这个梯度来自深度loss通过alpha blending产生的screenspace位置梯度
+            grad_2d = torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
+            # 使用较小的放大因子，让2D梯度作为"约束项"而不是主导项
+            self.xyz_gradient_accum[update_filter] += grad_2d * 50.0
+            has_grad = True
+
+        if has_grad:
+            self.denom[update_filter] += 1
