@@ -590,7 +590,7 @@ class GaussianModel:
         if self._xyz.grad is not None:
             # 3D位置梯度：深度对齐信号
             grad_3d = torch.norm(self._xyz.grad[update_filter], dim=-1, keepdim=True)
-            self.xyz_gradient_accum[update_filter] += grad_3d * 100.0
+            self.xyz_gradient_accum[update_filter] += grad_3d * 200.0
             has_grad = True
 
         # 方案2：叠加2D screenspace梯度（如果可用）
