@@ -540,28 +540,27 @@ class GaussianModel:
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
 
-        # 添加mask约束：裁剪不在有效区域的点
-        # 注意：densify_and_clone和densify_and_split会增加点数，
-        # 需要为新增的点也计算mask约束
+        # Method 1: Aggressive pruning for points outside mask
+        # 对mask外的点使用更严格的opacity threshold，快速移除发散点
         if valid_region_mask is not None:
-            # 当前点数
-            num_points_now = self.get_xyz.shape[0]
+            # 对densification前的原始点进行aggressive pruning
+            outside_mask = ~valid_region_mask
 
-            # 如果点数增加了，需要为新点重新计算mask约束
-            if num_points_now > num_points_before:
-                # 为新点创建mask（新增的点继承自在mask内的点，所以默认标记为有效）
-                # 但为了安全，我们对所有点重新计算mask
-                # 这里简化处理：扩展valid_region_mask以匹配新的点数
-                extended_mask = torch.zeros(num_points_now, dtype=torch.bool, device="cuda")
-                extended_mask[:num_points_before] = valid_region_mask
-                # 新增的点默认标记为有效（因为它们是从有效点克隆/分裂出来的）
-                extended_mask[num_points_before:] = True
+            # 更严格的opacity threshold：0.05 (是常规0.005的10倍)
+            aggressive_threshold = 0.05
+            outside_low_opacity = (self.get_opacity[:num_points_before] < aggressive_threshold).squeeze() & outside_mask
 
-                outside_mask = ~extended_mask
-            else:
-                outside_mask = ~valid_region_mask
+            # 扩展mask以匹配当前点数（densification可能增加了点）
+            extended_outside_prune = torch.zeros(self.get_xyz.shape[0], dtype=torch.bool, device="cuda")
+            extended_outside_prune[:num_points_before] = outside_low_opacity
 
-            prune_mask = torch.logical_or(prune_mask, outside_mask)
+            # 合并到总的pruning mask
+            prune_mask = torch.logical_or(prune_mask, extended_outside_prune)
+
+            # Debug信息
+            if outside_low_opacity.sum().item() > 0:
+                print(f"[Aggressive Pruning] Removing {outside_low_opacity.sum().item()} "
+                      f"low-opacity points outside mask (threshold={aggressive_threshold})")
 
         self.prune_points(prune_mask)
         tmp_radii = self.tmp_radii
@@ -590,7 +589,7 @@ class GaussianModel:
         if self._xyz.grad is not None:
             # 3D位置梯度：深度对齐信号
             grad_3d = torch.norm(self._xyz.grad[update_filter], dim=-1, keepdim=True)
-            self.xyz_gradient_accum[update_filter] += grad_3d * 200.0
+            self.xyz_gradient_accum[update_filter] += grad_3d * 175.0
             has_grad = True
 
         # 方案2：叠加2D screenspace梯度（如果可用）
