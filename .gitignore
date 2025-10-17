@@ -10,3 +10,6 @@ data
 depth_mask
 invdepth
 colmap_bak
+data1
+data2
+output
