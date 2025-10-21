@@ -29,6 +29,7 @@ class CameraInfo(NamedTuple):
     T: np.array
     FovY: np.array
     FovX: np.array
+    prcppoint: np.array  # 主点 [cx_normalized, cy_normalized]
     depth_params: dict
     image_path: str
     image_name: str
@@ -102,30 +103,28 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
         R = np.transpose(qvec2rotmat(extr.qvec))  # R = R_original^T
         C = np.array(extr.tvec)  # 假设这是相机中心
 
-        # 检测是否需要转换（通过验证投影）
-        # 简单启发式：如果T的值看起来像相机中心（绝对值较小），则转换
-        # 否则假设已经是标准格式
-        USE_CAMERA_CENTER_FORMAT = True  # 设置为True使用相机中心格式
-
-        if USE_CAMERA_CENTER_FORMAT:
-            # T是相机中心，转换为标准tvec
-            R_original = qvec2rotmat(extr.qvec)  # 未转置的R
-            T = -R_original @ C  # 标准COLMAP tvec
-        else:
-            # T已经是标准tvec
-            T = C
+        T = C
 
         if intr.model=="SIMPLE_PINHOLE":
             focal_length_x = intr.params[0]
             FovY = focal2fov(focal_length_x, height)
             FovX = focal2fov(focal_length_x, width)
+            # SIMPLE_PINHOLE: params = [f, cx, cy]
+            cx = intr.params[1] if len(intr.params) > 1 else width / 2.0
+            cy = intr.params[2] if len(intr.params) > 2 else height / 2.0
         elif intr.model=="PINHOLE":
             focal_length_x = intr.params[0]
             focal_length_y = intr.params[1]
             FovY = focal2fov(focal_length_y, height)
             FovX = focal2fov(focal_length_x, width)
+            # PINHOLE: params = [fx, fy, cx, cy]
+            cx = intr.params[2]
+            cy = intr.params[3]
         else:
             assert False, "Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!"
+
+        # 归一化主点坐标 (相对于图像尺寸)
+        prcppoint = np.array([cx / width, cy / height])
 
         n_remove = len(extr.name.split('.')[-1]) + 1
         depth_params = None
@@ -150,7 +149,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
             depth_path = ""
 
 
-        cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, depth_params=depth_params,
+        cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, prcppoint=prcppoint, depth_params=depth_params,
                               image_path=image_path, image_name=image_name, depth_path=depth_path,
                               width=width, height=height, is_test=image_name in test_cam_names_list)
         cam_infos.append(cam_info)
@@ -304,12 +303,15 @@ def readCamerasFromTransforms(path, transformsfile, depths_folder, white_backgro
             image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
 
             fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
-            FovY = fovy 
+            FovY = fovy
             FovX = fovx
+
+            # NeRF Synthetic 数据集假设主点在图像中心
+            prcppoint = np.array([0.5, 0.5])
 
             depth_path = os.path.join(depths_folder, f"{image_name}.png") if depths_folder != "" else ""
 
-            cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX,
+            cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, prcppoint=prcppoint,
                             image_path=image_path, image_name=image_name,
                             width=image.size[0], height=image.size[1], depth_path=depth_path, depth_params=None, is_test=is_test))
             

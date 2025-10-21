@@ -61,12 +61,20 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
                     print(f"[Warn] invdepth not found or unreadable: '{cam_info.depth_path}'. Skip this view's depth.")
                     invdepthmap = None
                 else:
-                    invdepthmap = raw.astype(np.float32)
+                    # 深度图存储的是真实深度值（单位：毫米）
+                    # 需要转换为逆深度（单位：1/米）
+                    depth_mm = raw.astype(np.float32)
+                    depth_m = depth_mm / 1000.0  # 毫米转米
+
+                    # 转换为逆深度（invdepth = 1 / depth）
+                    # 注意：需要处理depth=0的情况
+                    invdepthmap = np.zeros_like(depth_m)
+                    valid_mask = depth_m > 0
+                    invdepthmap[valid_mask] = 1.0 / depth_m[valid_mask]
+
                     if is_nerf_synthetic:
-                        invdepthmap = invdepthmap / 512.0
-                    else:
-                        maxv = 65535.0 if invdepthmap.max() > 255 else 255.0
-                        invdepthmap = invdepthmap / maxv
+                        # NeRF synthetic数据集的特殊处理（如果需要）
+                        pass
         except Exception as e:
             print(f"An unexpected error occurred when trying to read depth at {cam_info.depth_path}: {e}")
             invdepthmap = None
@@ -112,11 +120,13 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
     except Exception as e:
         print(f"[Warn] depth_mask load failed for {cam_info.image_name}: {e}")
 
-    return Camera(resolution, colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
-                  FoVx=cam_info.FovX, FoVy=cam_info.FovY, depth_params=cam_info.depth_params,
+    depth_only = getattr(args, "depth_only", False)
+
+    return Camera(resolution, colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,
+                  FoVx=cam_info.FovX, FoVy=cam_info.FovY, prcppoint=cam_info.prcppoint, depth_params=cam_info.depth_params,
                   image=image, invdepthmap=invdepthmap,
                   image_name=cam_info.image_name, uid=id, data_device=args.data_device,
-                  train_test_exp=args.train_test_exp, is_test_dataset=is_test_dataset, is_test_view=cam_info.is_test,depth_mask=depth_mask)
+                  train_test_exp=args.train_test_exp, is_test_dataset=is_test_dataset, is_test_view=cam_info.is_test,depth_only=depth_only,depth_mask=depth_mask)
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args, is_nerf_synthetic, is_test_dataset):
     camera_list = []

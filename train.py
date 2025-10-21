@@ -21,7 +21,7 @@ from utils.general_utils import safe_state, get_expon_lr_func
 from utils.mask_utils import compute_mask_constraint
 import uuid
 from tqdm import tqdm
-from utils.image_utils import psnr
+from utils.image_utils import psnr,depth2normal
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 try:
@@ -137,7 +137,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Depth regularization
         Ll1depth_pure = 0.0
         if depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
-            # 注意：渲染器返回的是 inverse depth（逆深度），不是 depth
+            # 渲染器返回的是 inverse depth（逆深度），不是 depth
             # CUDA代码中：expected_invdepth += (1 / depths[j]) * alpha * T
             invDepth = render_pkg["depth"]
             mono_invdepth = viewpoint_cam.invdepthmap.cuda()
@@ -145,14 +145,30 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             alpha_mask = getattr(viewpoint_cam, "alpha_mask", None)
 
-            if alpha_mask is not None:
-                depth_mask = depth_mask * alpha_mask.cuda().clamp(0.0, 1.0)
+            # if alpha_mask is not None:
+            #     depth_mask = depth_mask * alpha_mask.cuda().clamp(0.0, 1.0)
 
             valid = (depth_mask > 0.5).float()
             denom = valid.sum().clamp(min=1.0)
 
+            # 原始深度L1损失
             Ll1depth_pure = torch.abs((invDepth  - mono_invdepth) * depth_mask).sum() / denom
-            Ll1depth_tensor = depth_l1_weight(iteration) * Ll1depth_pure
+
+            # 法向一致性loss：比较渲染深度和单目深度各自计算出的法向
+            # 从渲染深度计算法向
+            render_normal = depth2normal(invDepth, depth_mask, viewpoint_cam)
+            # 从单目深度计算法向
+            mono_normal = depth2normal(mono_invdepth, depth_mask, viewpoint_cam)
+
+            # 计算法向余弦相似度 (越接近1越好)
+            cos_sim = (render_normal * mono_normal).sum(dim=0)  # [H, W]
+            # 转换为loss：1 - similarity
+            loss_normal_depth = ((1.0 - cos_sim) * depth_mask).sum() / denom
+
+            # 组合损失：深度loss + 法向一致性loss
+            normal_depth_weight = 0.1  # 法向loss权重
+            Ll1depth_tensor = depth_l1_weight(iteration) * (Ll1depth_pure + normal_depth_weight * loss_normal_depth)
+
             loss = loss + Ll1depth_tensor
             Ll1depth = Ll1depth_tensor.item()
         else:
@@ -169,12 +185,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             if iteration % 10 == 0:
                 postfix_dict = {"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"}
-
-                # 添加坐标变换参数的监控 (每100次显示一次)
-                if gaussians.transform_optimizer is not None and iteration % 100 == 0:
-                    t = gaussians._transform_translation.data.cpu().numpy()
-                    postfix_dict["T"] = f"[{t[0]:.3f},{t[1]:.3f},{t[2]:.3f}]"
-
                 progress_bar.set_postfix(postfix_dict)
                 progress_bar.update(10)
             if iteration == opt.iterations:
@@ -196,13 +206,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
 
                     # 计算mask约束：判断每个Gaussian点是否在至少一个视图的mask内
-                    # 注意：如果使用了可学习的坐标变换，完全禁用mask constraint
-                    # 因为：1) 坐标变换需要时间学习收敛
-                    #      2) 即使变换收敛，原始点云中仍有很多点不在mask内（但它们是椅子的一部分）
-                    #      3) 深度loss已经提供了足够的监督，不需要mask constraint
                     valid_region_mask = None
-                    if dataset.depth_mask_dir != "" and gaussians.transform_optimizer is None:
-                        # 只有在没有坐标变换时才使用mask约束
+                    if dataset.depth_mask_dir != "":
                         valid_region_mask = compute_mask_constraint(gaussians, scene, render, pipe, background)
 
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii, valid_region_mask)
@@ -215,11 +220,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.exposure_optimizer.step()
                 gaussians.exposure_optimizer.zero_grad(set_to_none = True)
 
-                # 坐标变换优化器
-                if gaussians.transform_optimizer is not None:
-                    gaussians.transform_optimizer.step()
-                    gaussians.transform_optimizer.zero_grad(set_to_none=True)
-
                 if use_sparse_adam:
                     visible = radii > 0
                     gaussians.optimizer.step(visible, radii.shape[0])
@@ -231,21 +231,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
-
-    # 训练结束后打印学习到的坐标变换参数
-    if gaussians.transform_optimizer is not None:
-        print("\n" + "="*70)
-        print("Learned Coordinate Transformation:")
-        print("="*70)
-        quat = gaussians._transform_rotation.data.cpu().numpy()
-        trans = gaussians._transform_translation.data.cpu().numpy()
-        print(f"  Rotation (quaternion): [{quat[0]:.4f}, {quat[1]:.4f}, {quat[2]:.4f}, {quat[3]:.4f}]")
-        print(f"  Translation: [{trans[0]:.4f}, {trans[1]:.4f}, {trans[2]:.4f}]")
-        if gaussians._transform_scale is not None:
-            scale_log = gaussians._transform_scale.data.cpu().item()
-            scale = np.exp(scale_log)
-            print(f"  Scale: {scale:.4f} (log: {scale_log:.4f})")
-        print("="*70)
 
 def prepare_output_and_logger(args):    
     if not args.model_path:

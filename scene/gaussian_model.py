@@ -63,13 +63,6 @@ class GaussianModel:
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
-
-        # 可学习的坐标变换参数 (用于对齐点云和相机坐标系)
-        self._transform_rotation = None  # 旋转 (quaternion or rotation matrix)
-        self._transform_translation = None  # 平移
-        self._transform_scale = None  # 缩放 (optional)
-        self.transform_optimizer = None
-
         self.setup_functions()
 
     def capture(self):
@@ -116,39 +109,8 @@ class GaussianModel:
     
     @property
     def get_xyz(self):
-        """获取坐标（应用变换后）"""
-        if self._transform_rotation is not None and self._transform_translation is not None:
-            # 应用可学习的坐标变换
-            return self.apply_coordinate_transform(self._xyz)
+        """获取3D高斯中心坐标"""
         return self._xyz
-
-    def apply_coordinate_transform(self, xyz):
-        """应用坐标变换: xyz_new = s * R @ xyz + t"""
-        # 将四元数转换为旋转矩阵
-        quat = self._transform_rotation / torch.norm(self._transform_rotation)  # 手动归一化
-        w, x, y, z = quat[0], quat[1], quat[2], quat[3]
-
-        # 四元数转旋转矩阵
-        R = torch.zeros((3, 3), device=xyz.device)
-        R[0, 0] = 1 - 2*(y**2 + z**2)
-        R[0, 1] = 2*(x*y - w*z)
-        R[0, 2] = 2*(x*z + w*y)
-        R[1, 0] = 2*(x*y + w*z)
-        R[1, 1] = 1 - 2*(x**2 + z**2)
-        R[1, 2] = 2*(y*z - w*x)
-        R[2, 0] = 2*(x*z - w*y)
-        R[2, 1] = 2*(y*z + w*x)
-        R[2, 2] = 1 - 2*(x**2 + y**2)
-
-        # 应用变换
-        xyz_transformed = xyz @ R.T + self._transform_translation.unsqueeze(0)
-
-        # 如果有缩放参数
-        if self._transform_scale is not None:
-            scale = torch.exp(self._transform_scale)  # 确保正值
-            xyz_transformed = xyz_transformed * scale
-
-        return xyz_transformed
     
     @property
     def get_features(self):
@@ -166,7 +128,7 @@ class GaussianModel:
     
     @property
     def get_opacity(self):
-        return self.opacity_activation(self._opacity)
+        return 0.8+0.2*self.opacity_activation(self._opacity)
     
     @property
     def get_exposure(self):
@@ -204,6 +166,7 @@ class GaussianModel:
         opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
 
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
+        self._xyz_init = fused_point_cloud.clone().detach()  # 保存初始位置，用于正则化
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
         self._scaling = nn.Parameter(scales.requires_grad_(True))
@@ -214,14 +177,6 @@ class GaussianModel:
         self.pretrained_exposures = None
         exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)
         self._exposure = nn.Parameter(exposure.requires_grad_(True))
-
-        # 初始化可学习的坐标变换参数
-        # 旋转: 初始化为单位四元数 [w=1, x=0, y=0, z=0]
-        self._transform_rotation = nn.Parameter(torch.tensor([1.0, 0.0, 0.0, 0.0], device="cuda").requires_grad_(True))
-        # 平移: 初始化为零向量
-        self._transform_translation = nn.Parameter(torch.zeros(3, device="cuda").requires_grad_(True))
-        # 缩放: 初始化为0 (exp(0)=1，即不缩放)
-        self._transform_scale = nn.Parameter(torch.tensor(0.0, device="cuda").requires_grad_(True))
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -248,22 +203,6 @@ class GaussianModel:
 
         # 曝光优化器
         self.exposure_optimizer = torch.optim.Adam([self._exposure])
-
-        # 坐标变换优化器 (如果启用)
-        if self._transform_rotation is not None:
-            transform_params = [
-                {'params': [self._transform_rotation], 'lr': 0.001, 'name': 'transform_rotation'},
-                {'params': [self._transform_translation], 'lr': 0.01, 'name': 'transform_translation'},
-            ]
-            if self._transform_scale is not None:
-                transform_params.append({'params': [self._transform_scale], 'lr': 0.001, 'name': 'transform_scale'})
-
-            self.transform_optimizer = torch.optim.Adam(transform_params, lr=0.0, eps=1e-15)
-            print("[Coordinate Transform] Learnable transformation parameters initialized")
-            print(f"  Rotation (quaternion): {self._transform_rotation.data.cpu().numpy()}")
-            print(f"  Translation: {self._transform_translation.data.cpu().numpy()}")
-            if self._transform_scale is not None:
-                print(f"  Scale (log): {self._transform_scale.data.cpu().numpy()}")
 
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
@@ -535,10 +474,27 @@ class GaussianModel:
         self.densify_and_split(grads, max_grad, extent)
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
+
+        # 自适应aggressive opacity pruning：根据点云密度调整
+        # 对于稠密点云（>200K点），禁用aggressive pruning，避免过度删除
+        # 对于稀疏点云（<200K点），使用aggressive pruning，移除低质量点
+        if self.get_xyz.shape[0] < 200000:
+            # 稀疏点云：使用aggressive opacity pruning
+            aggressive_opacity_threshold = 0.1
+            low_opacity_mask = (self.get_opacity < aggressive_opacity_threshold).squeeze()
+            prune_mask = torch.logical_or(prune_mask, low_opacity_mask)
+        # else: 稠密点云，跳过aggressive pruning
+
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+
+        # 额外的pruning策略：移除过大的gaussians（防止发散）
+        # 对于深度监督训练，过大的gaussian通常是发散的标志
+        # 放宽阈值从0.05到0.1，对稠密点云更宽容
+        very_large_gaussians = self.get_scaling.max(dim=1).values > 0.1 * extent
+        prune_mask = torch.logical_or(prune_mask, very_large_gaussians)
 
         # Method 1: Aggressive pruning for points outside mask
         # 对mask外的点使用更严格的opacity threshold，快速移除发散点
@@ -585,20 +541,21 @@ class GaussianModel:
 
         has_grad = False
 
-        # 方案1：优先使用3D梯度（如果可用）
-        if self._xyz.grad is not None:
-            # 3D位置梯度：深度对齐信号
-            grad_3d = torch.norm(self._xyz.grad[update_filter], dim=-1, keepdim=True)
-            self.xyz_gradient_accum[update_filter] += grad_3d * 150.0
+        # 方案1：优先使用2D screenspace梯度（防止发散）
+        if viewspace_point_tensor.grad is not None:
+            # 2D screenspace梯度：提供图像平面约束，防止点云发散
+            # 这个梯度来自深度loss通过alpha blending产生的screenspace位置梯度
+            grad_2d = torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
+            # 降低放大因子，减少densification，控制点云密度
+            self.xyz_gradient_accum[update_filter] += grad_2d * 10.0
             has_grad = True
 
-        # 方案2：叠加2D screenspace梯度（如果可用）
-        if viewspace_point_tensor.grad is not None:
-            # 2D screenspace梯度：空间约束信号
-            # 注意：这个梯度来自深度loss通过alpha blending产生的screenspace位置梯度
-            grad_2d = torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
-            # 使用较小的放大因子，让2D梯度作为"约束项"而不是主导项
-            self.xyz_gradient_accum[update_filter] += grad_2d * 50.0
+        # 方案2：可选的3D梯度（如果2D梯度不足）
+        if self._xyz.grad is not None and not has_grad:
+            # 3D位置梯度：深度对齐信号
+            # 只在没有2D梯度时使用，避免过度densification
+            grad_3d = torch.norm(self._xyz.grad[update_filter], dim=-1, keepdim=True)
+            self.xyz_gradient_accum[update_filter] += grad_3d * 5.0
             has_grad = True
 
         if has_grad:
