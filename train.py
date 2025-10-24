@@ -121,21 +121,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             image *= alpha_mask
 
         # Loss
+        # RGB Loss (已注释，仅使用深度监督)
         # gt_image = viewpoint_cam.original_image.cuda()
         # Ll1 = l1_loss(image, gt_image)
         # if FUSED_SSIM_AVAILABLE:
         #     ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
         # else:
         #     ssim_value = ssim(image, gt_image)
-        #
         # loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
+        # 初始化loss组件
         loss = torch.tensor(0.0, device="cuda", requires_grad=True)
-        Ll1 = torch.tensor(0.0, device="cuda")
-        Ll1depth = 0.0
+        loss_depth_l1 = 0.0
+        loss_normal = 0.0
 
-        # Depth regularization
-        Ll1depth_pure = 0.0
+        # Depth regularization with normal consistency
         if depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
             # 渲染器返回的是 inverse depth（逆深度），不是 depth
             # CUDA代码中：expected_invdepth += (1 / depths[j]) * alpha * T
@@ -151,10 +151,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             valid = (depth_mask > 0.5).float()
             denom = valid.sum().clamp(min=1.0)
 
-            # 原始深度L1损失
-            Ll1depth_pure = torch.abs((invDepth  - mono_invdepth) * depth_mask).sum() / denom
+            # 1. 深度L1损失
+            depth_l1_pure = torch.abs((invDepth - mono_invdepth) * depth_mask).sum() / denom
+            loss_depth_l1 = depth_l1_weight(iteration) * depth_l1_pure
 
-            # 法向一致性loss：比较渲染深度和单目深度各自计算出的法向
+            # 2. 法向一致性loss：比较渲染深度和单目深度各自计算出的法向
             # 从渲染深度计算法向
             render_normal = depth2normal(invDepth, depth_mask, viewpoint_cam)
             # 从单目深度计算法向
@@ -163,16 +164,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # 计算法向余弦相似度 (越接近1越好)
             cos_sim = (render_normal * mono_normal).sum(dim=0)  # [H, W]
             # 转换为loss：1 - similarity
-            loss_normal_depth = ((1.0 - cos_sim) * depth_mask).sum() / denom
+            normal_loss_pure = ((1.0 - cos_sim) * depth_mask).sum() / denom
 
-            # 组合损失：深度loss + 法向一致性loss
-            normal_depth_weight = 0.1  # 法向loss权重
-            Ll1depth_tensor = depth_l1_weight(iteration) * (Ll1depth_pure + normal_depth_weight * loss_normal_depth)
+            # 法向loss权重
+            normal_weight = 0.2
+            loss_normal = depth_l1_weight(iteration) * normal_weight * normal_loss_pure
 
-            loss = loss + Ll1depth_tensor
-            Ll1depth = Ll1depth_tensor.item()
-        else:
-            Ll1depth = 0
+            # 总loss = 深度loss + 法向loss
+            loss = loss + loss_depth_l1 + loss_normal
 
         loss.backward()
 
@@ -181,7 +180,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         with torch.no_grad():
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
-            ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
+
+            # 处理 loss_depth_l1 可能是 float 或 tensor 的情况
+            depth_loss_value = loss_depth_l1.item() if isinstance(loss_depth_l1, torch.Tensor) else loss_depth_l1
+            ema_Ll1depth_for_log = 0.4 * depth_loss_value + 0.6 * ema_Ll1depth_for_log
 
             if iteration % 10 == 0:
                 postfix_dict = {"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"}
@@ -191,7 +193,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
+            training_report(tb_writer, iteration, loss_depth_l1 if isinstance(loss_depth_l1, torch.Tensor) else torch.tensor(0.0), loss, torch.tensor(0.0), iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -254,7 +256,7 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss_value, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -263,7 +265,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
     # Report test and samples of training set
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
-        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
+        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()},
                               {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
 
         for config in validation_configs:
@@ -283,7 +285,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
                 psnr_test /= len(config['cameras'])
-                l1_test /= len(config['cameras'])          
+                l1_test /= len(config['cameras'])
                 print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
