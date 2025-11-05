@@ -84,26 +84,11 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
 
         uid = intr.id
 
-        # 处理非标准COLMAP格式（extern.txt中T是相机中心）
-        # 标准COLMAP: R是旋转矩阵, tvec使得 X_cam = R * X_world + tvec
-        # 非标准格式: T是相机中心C, X_cam = R * (X_world - C)
-        #
-        # 在dataset_readers.py中，R = np.transpose(qvec2rotmat(extr.qvec))
-        # 所以R已经是R^T了
-        #
-        # getWorld2View2(R, t) 期望:
-        #   - R是转置后的旋转矩阵（已满足）
-        #   - t是tvec（标准COLMAP格式）
-        #
-        # 如果extern.txt中T=C（相机中心），我们需要转换：
-        # 标准tvec = -R_original * C
-        # 但R = R_original^T，所以：
-        # 标准tvec = -R^T * C
-
-        R = np.transpose(qvec2rotmat(extr.qvec))  # R = R_original^T
-        C = np.array(extr.tvec)  # 假设这是相机中心
-
-        T = C
+        # COLMAP坐标系统：
+        # getWorld2View2(R, t)内部会执行 Rt[:3,:3] = R.transpose()
+        # 因此需要传入 R = R_world2cam^T，函数内转置后得到正确的R_world2cam
+        R = np.transpose(qvec2rotmat(extr.qvec))
+        T = np.array(extr.tvec)
 
         if intr.model=="SIMPLE_PINHOLE":
             focal_length_x = intr.params[0]

@@ -134,6 +134,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         loss = torch.tensor(0.0, device="cuda", requires_grad=True)
         loss_depth_l1 = 0.0
         loss_normal = 0.0
+        loss_smooth = 0.0
 
         # Depth regularization with normal consistency
         if depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
@@ -147,6 +148,37 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # if alpha_mask is not None:
             #     depth_mask = depth_mask * alpha_mask.cuda().clamp(0.0, 1.0)
+
+            # === 深度尺度对齐：使用跨视角一致性对齐 ===
+            # 第一次运行时计算全局对齐参数（只计算一次）
+            # if not hasattr(scene, 'depth_alignment_params'):
+            #     from utils.depth_alignment import align_depth_cross_view
+
+            #     # 使用所有训练相机进行跨视角对齐
+            #     all_cameras = scene.getTrainCameras()
+            #     scene.depth_alignment_params = align_depth_cross_view(all_cameras, max_views=10)
+
+            #     if len(scene.depth_alignment_params) == 0:li
+            #         print("[Warning] Cross-view depth alignment failed, using identity scale")
+            #         scene.depth_alignment_params = None
+
+            # # 应用对齐参数
+            # if scene.depth_alignment_params is not None and viewpoint_cam.image_name in scene.depth_alignment_params:
+            #     scale, shift = scene.depth_alignment_params[viewpoint_cam.image_name]
+
+            #     # 转换逆深度为深度
+            #     mono_depth = 1.0 / (mono_invdepth.squeeze(0) + 1e-6)
+
+            #     # 应用对齐
+            #     aligned_depth = scale * mono_depth + shift
+
+            #     # 转回逆深度
+            #     mono_invdepth = 1.0 / (aligned_depth.unsqueeze(0) + 1e-6)
+
+            #     if iteration % 1000 == 0:
+            #         print(f"[Iter {iteration}] View {viewpoint_cam.image_name}: "
+            #               f"depth alignment scale={scale:.4f}")
+            # === 深度对齐结束 ===
 
             valid = (depth_mask > 0.5).float()
             denom = valid.sum().clamp(min=1.0)
@@ -168,10 +200,39 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # 法向loss权重
             normal_weight = 0.2
-            loss_normal = depth_l1_weight(iteration) * normal_weight * normal_loss_pure
+            # loss_normal = depth_l1_weight(iteration) * normal_weight * normal_loss_pure
+            loss_normal = normal_weight * normal_loss_pure
 
-            # 总loss = 深度loss + 法向loss
-            loss = loss + loss_depth_l1 + loss_normal
+            # 3. 深度平滑loss：惩罚深度不连续，去除离散点云
+            # 在迭代5000后启用，给足够时间让模型先收敛
+            lambda_smooth = 0.5 if iteration > 5000 else 0.0
+            loss_smooth = 0.0
+
+            if lambda_smooth > 0:
+                # 转换逆深度为深度
+                depth_render = 1.0 / (invDepth.squeeze(0) + 1e-6)
+
+                # 计算深度梯度（水平和垂直方向）
+                # 如果存在离散点云，深度会有突变，梯度会很大
+                grad_x = torch.abs(depth_render[:, 1:] - depth_render[:, :-1])  # [H, W-1]
+                grad_y = torch.abs(depth_render[1:, :] - depth_render[:-1, :])  # [H-1, W]
+
+                # 只在mask有效的相邻区域计算
+                mask_2d = depth_mask.squeeze(0)
+                mask_x = mask_2d[:, 1:] * mask_2d[:, :-1]  # 相邻像素都有效
+                mask_y = mask_2d[1:, :] * mask_2d[:-1, :]
+
+                # 计算有效区域的梯度均值
+                denom_x = mask_x.sum().clamp(min=1.0)
+                denom_y = mask_y.sum().clamp(min=1.0)
+
+                loss_smooth = lambda_smooth * (
+                    (grad_x * mask_x).sum() / denom_x +
+                    (grad_y * mask_y).sum() / denom_y
+                )
+
+            # 总loss = 深度loss + 法向loss + 平滑loss
+            loss = loss + loss_depth_l1 + loss_normal + loss_smooth
 
         loss.backward()
 
@@ -185,8 +246,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             depth_loss_value = loss_depth_l1.item() if isinstance(loss_depth_l1, torch.Tensor) else loss_depth_l1
             ema_Ll1depth_for_log = 0.4 * depth_loss_value + 0.6 * ema_Ll1depth_for_log
 
+            # 处理平滑loss
+            smooth_loss_value = loss_smooth.item() if isinstance(loss_smooth, torch.Tensor) else loss_smooth
+
             if iteration % 10 == 0:
-                postfix_dict = {"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"}
+                postfix_dict = {
+                    "Loss": f"{ema_loss_for_log:.{7}f}",
+                    "Depth": f"{ema_Ll1depth_for_log:.{7}f}",
+                    "Smooth": f"{smooth_loss_value:.{5}f}"
+                }
                 progress_bar.set_postfix(postfix_dict)
                 progress_bar.update(10)
             if iteration == opt.iterations:
