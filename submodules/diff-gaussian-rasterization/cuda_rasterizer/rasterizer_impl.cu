@@ -217,6 +217,7 @@ int CudaRasterizer::Rasterizer::forward(
 	const bool prefiltered,
 	float* out_color,
 	float* depth,
+	float* depth_distortion,
 	bool antialiasing,
 	int* radii,
 	bool debug)
@@ -335,7 +336,8 @@ int CudaRasterizer::Rasterizer::forward(
 		background,
 		out_color,
 		geomState.depths,
-		depth), debug)
+		depth,
+		depth_distortion), debug)
 
 	return num_rendered;
 }

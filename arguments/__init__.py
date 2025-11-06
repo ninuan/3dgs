@@ -91,9 +91,9 @@ class OptimizationParams(ParamGroup):
         self.lambda_dssim = 0.2
         self.densification_interval = 100
         self.opacity_reset_interval = 3000
-        self.densify_from_iter = 500
-        self.densify_until_iter = 10_000  # 更早停止densification，防止后期发散
-        self.densify_grad_threshold = 0.01  # 进一步提高阈值，更严格控制densification
+        self.densify_from_iter = 1500  # 延迟开始，给depth distortion loss时间建立薄表面
+        self.densify_until_iter = 10_000  # 从7000改为10000：延长densification，防止点数过早崩溃
+        self.densify_grad_threshold = 0.015  # 从0.01提高到0.015：更严格，减少densification
         self.depth_l1_weight_init = 10.0  # 提高初始权重，增强深度约束
         self.depth_l1_weight_final = 1.0  # 保持较高的最终权重
         self.random_background = False

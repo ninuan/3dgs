@@ -473,52 +473,26 @@ class GaussianModel:
         self.densify_and_clone(grads, max_grad, extent, valid_region_mask)
         self.densify_and_split(grads, max_grad, extent)
 
+        # === 标准3DGS Pruning + 温和的scale约束 ===
+        # 只保留基础的opacity pruning，让depth_distortion loss自然工作
         prune_mask = (self.get_opacity < min_opacity).squeeze()
-
-        # 自适应aggressive opacity pruning：根据点云密度调整
-        # 对于稠密点云（>200K点），禁用aggressive pruning，避免过度删除
-        # 对于稀疏点云（<200K点），使用aggressive pruning，移除低质量点
-        if self.get_xyz.shape[0] < 200000:
-            # 稀疏点云：使用aggressive opacity pruning
-            aggressive_opacity_threshold = 0.1
-            low_opacity_mask = (self.get_opacity < aggressive_opacity_threshold).squeeze()
-            prune_mask = torch.logical_or(prune_mask, low_opacity_mask)
-        # else: 稠密点云，跳过aggressive pruning
 
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
-            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent  # 恢复标准3DGS的0.1阈值
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
 
-        # 额外的pruning策略：移除过大的gaussians（防止发散）
-        # 对于深度监督训练，过大的gaussian通常是发散的标志
-        # 放宽阈值从0.05到0.1，对稠密点云更宽容
-        very_large_gaussians = self.get_scaling.max(dim=1).values > 0.1 * extent
+        # 温和的scale pruning：只删除极端大的高斯（细长"刺"）
+        # 诊断：max depth_dist=1.613说明有极高variance的射线
+        # 使用0.15 * extent（比标准0.1宽松，但能删除最极端的情况）
+        very_large_gaussians = self.get_scaling.max(dim=1).values > 0.15 * extent
         prune_mask = torch.logical_or(prune_mask, very_large_gaussians)
 
-        # Method 1: Aggressive pruning for points outside mask
-        # 对mask外的点使用更严格的opacity threshold，快速移除发散点
-        if valid_region_mask is not None:
-            # 对densification前的原始点进行aggressive pruning
-            outside_mask = ~valid_region_mask
-
-            # 更严格的opacity threshold：0.05 (是常规0.005的10倍)
-            aggressive_threshold = 0.05
-            outside_low_opacity = (self.get_opacity[:num_points_before] < aggressive_threshold).squeeze() & outside_mask
-
-            # 扩展mask以匹配当前点数（densification可能增加了点）
-            extended_outside_prune = torch.zeros(self.get_xyz.shape[0], dtype=torch.bool, device="cuda")
-            extended_outside_prune[:num_points_before] = outside_low_opacity
-
-            # 合并到总的pruning mask
-            prune_mask = torch.logical_or(prune_mask, extended_outside_prune)
-
-            # Debug信息
-            if outside_low_opacity.sum().item() > 0:
-                print(f"[Aggressive Pruning] Removing {outside_low_opacity.sum().item()} "
-                      f"low-opacity points outside mask (threshold={aggressive_threshold})")
-
         self.prune_points(prune_mask)
+
+        num_removed = prune_mask.sum().item()
+        num_remaining = self.get_xyz.shape[0]
+        print(f"[Standard Pruning] {num_removed} points removed, {num_remaining} points remaining")
         tmp_radii = self.tmp_radii
         self.tmp_radii = None
 

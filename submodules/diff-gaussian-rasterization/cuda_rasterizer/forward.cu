@@ -269,7 +269,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 }
 
 // Main rasterization method. Collaboratively works on one tile per
-// block, each thread treats one pixel. Alternates between fetching 
+// block, each thread treats one pixel. Alternates between fetching
 // and rasterizing data.
 template <uint32_t CHANNELS>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
@@ -285,7 +285,8 @@ renderCUDA(
 	const float* __restrict__ bg_color,
 	float* __restrict__ out_color,
 	const float* __restrict__ depths,
-	float* __restrict__ invdepth)
+	float* __restrict__ invdepth,
+	float* __restrict__ depth_distortion)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -318,6 +319,8 @@ renderCUDA(
 	float C[CHANNELS] = { 0 };
 
 	float expected_invdepth = 0.0f;
+	float expected_depth = 0.0f;  // For depth distortion calculation
+	float depth_var = 0.0f;  // Depth variance (distortion)
 
 	// Iterate over batches until all done or range is complete
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
@@ -374,11 +377,78 @@ renderCUDA(
 			if(invdepth)
 			expected_invdepth += (1 / depths[collected_id[j]]) * alpha * T;
 
+			// Accumulate expected depth for distortion calculation
+			if(depth_distortion)
+			expected_depth += depths[collected_id[j]] * alpha * T;
+
 			T = test_T;
 
 			// Keep track of last range entry to update this
 			// pixel.
 			last_contributor = contributor;
+		}
+	}
+
+	// Second pass: Calculate depth variance (distortion)
+	// This requires iterating through the same Gaussians again
+	// to compute (depth - expected_depth)^2 weighted by alpha*T
+	if (depth_distortion && !done)
+	{
+		// Reset state for second pass
+		T = 1.0f;
+		contributor = 0;
+		done = !inside;
+		toDo = range.y - range.x;
+
+		// Iterate over batches again
+		for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
+		{
+			// End if entire block votes that it is done
+			int num_done = __syncthreads_count(done);
+			if (num_done == BLOCK_SIZE)
+				break;
+
+			// Collectively fetch per-Gaussian data from global to shared
+			int progress = i * BLOCK_SIZE + block.thread_rank();
+			if (range.x + progress < range.y)
+			{
+				int coll_id = point_list[range.x + progress];
+				collected_id[block.thread_rank()] = coll_id;
+				collected_xy[block.thread_rank()] = points_xy_image[coll_id];
+				collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
+			}
+			block.sync();
+
+			// Iterate over current batch
+			for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
+			{
+				contributor++;
+
+				// Recompute alpha and T (same as first pass)
+				float2 xy = collected_xy[j];
+				float2 d = { xy.x - pixf.x, xy.y - pixf.y };
+				float4 con_o = collected_conic_opacity[j];
+				float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
+				if (power > 0.0f)
+					continue;
+
+				float alpha = min(0.99f, con_o.w * exp(power));
+				if (alpha < 1.0f / 255.0f)
+					continue;
+				float test_T = T * (1 - alpha);
+				if (test_T < 0.0001f)
+				{
+					done = true;
+					continue;
+				}
+
+				// Accumulate depth variance
+				float depth = depths[collected_id[j]];
+				float diff = depth - expected_depth;
+				depth_var += diff * diff * alpha * T;
+
+				T = test_T;
+			}
 		}
 	}
 
@@ -393,6 +463,9 @@ renderCUDA(
 
 		if (invdepth)
 		invdepth[pix_id] = expected_invdepth;// 1. / (expected_depth + T * 1e3);
+
+		if (depth_distortion)
+		depth_distortion[pix_id] = depth_var;
 	}
 }
 
@@ -409,7 +482,8 @@ void FORWARD::render(
 	const float* bg_color,
 	float* out_color,
 	float* depths,
-	float* depth)
+	float* depth,
+	float* depth_distortion)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
 		ranges,
@@ -422,8 +496,9 @@ void FORWARD::render(
 		n_contrib,
 		bg_color,
 		out_color,
-		depths, 
-		depth);
+		depths,
+		depth,
+		depth_distortion);
 }
 
 void FORWARD::preprocess(int P, int D, int M,

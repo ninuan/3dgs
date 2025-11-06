@@ -114,7 +114,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
-        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["rend" \
+        "er"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         if viewpoint_cam.alpha_mask is not None:
             alpha_mask = viewpoint_cam.alpha_mask.cuda()
@@ -135,6 +136,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         loss_depth_l1 = 0.0
         loss_normal = 0.0
         loss_smooth = 0.0
+        loss_depth_dist = 0.0  # 2DGS深度畸变loss
+        loss_depth_median = 0.0  # 深度中值约束，防止整体偏移
+        loss_depth_hard = 0.0  # 深度硬约束，惩罚超出范围的深度
 
         # Depth regularization with normal consistency
         if depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
@@ -183,56 +187,147 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             valid = (depth_mask > 0.5).float()
             denom = valid.sum().clamp(min=1.0)
 
-            # 1. 深度L1损失
-            depth_l1_pure = torch.abs((invDepth - mono_invdepth) * depth_mask).sum() / denom
-            loss_depth_l1 = depth_l1_weight(iteration) * depth_l1_pure
+            # 1. 深度L1损失 - 调整权重平衡
+            # BUG诊断：depth_l1_mult=0.2太低 → 点云缺乏GT约束 → 配合median loss bug导致崩溃
+            # 新策略：提高最低权重，提供足够的稳定性
+            if iteration < 5000:
+                depth_l1_multiplier = 0.5  # 从0.2提高到0.5，提供更多约束
+            elif iteration < 15000:
+                depth_l1_multiplier = 0.5 + 0.5 * (iteration - 5000) / 10000  # 0.5→1.0
+            else:
+                depth_l1_multiplier = 1.0  # 维持1.0（从0.5提高）
 
-            # 2. 法向一致性loss：比较渲染深度和单目深度各自计算出的法向
-            # 从渲染深度计算法向
-            render_normal = depth2normal(invDepth, depth_mask, viewpoint_cam)
-            # 从单目深度计算法向
-            mono_normal = depth2normal(mono_invdepth, depth_mask, viewpoint_cam)
+            # === 边缘自适应权重：降低边缘区域的深度L1权重 ===
+            # 原因：深度相机在边缘有系统性误差（飞点、边缘模糊）
+            # 策略：检测深度梯度大的区域（边缘），降低这些区域的loss权重
+            mono_depth = 1.0 / (mono_invdepth.squeeze(0) + 1e-6)
 
-            # 计算法向余弦相似度 (越接近1越好)
-            cos_sim = (render_normal * mono_normal).sum(dim=0)  # [H, W]
-            # 转换为loss：1 - similarity
-            normal_loss_pure = ((1.0 - cos_sim) * depth_mask).sum() / denom
+            # 计算深度梯度（水平和垂直方向）
+            grad_x = torch.abs(mono_depth[:, 1:] - mono_depth[:, :-1])  # [H, W-1]
+            grad_y = torch.abs(mono_depth[1:, :] - mono_depth[:-1, :])  # [H-1, W]
 
-            # 法向loss权重
-            normal_weight = 0.2
-            # loss_normal = depth_l1_weight(iteration) * normal_weight * normal_loss_pure
-            loss_normal = normal_weight * normal_loss_pure
+            # Pad回原始尺寸
+            grad_x = torch.nn.functional.pad(grad_x, (0, 1), value=0)  # [H, W]
+            grad_y = torch.nn.functional.pad(grad_y, (0, 0, 0, 1), value=0)  # [H, W]
 
-            # 3. 深度平滑loss：惩罚深度不连续，去除离散点云
-            # 在迭代5000后启用，给足够时间让模型先收敛
-            lambda_smooth = 0.5 if iteration > 5000 else 0.0
+            # 取最大梯度作为边缘指示
+            depth_gradient = torch.maximum(grad_x, grad_y)  # [H, W]
+
+            # 边缘检测：梯度 > 0.1米（10cm）认为是边缘
+            # 可以根据实际情况调整这个阈值：
+            # - 如果边缘artifact很严重，降低到0.05
+            # - 如果删除太多，提高到0.15
+            edge_threshold = 0.08  # 从0.1降低到0.08，更早检测边缘
+            is_edge = (depth_gradient > edge_threshold).unsqueeze(0)  # [1, H, W]
+
+            # 边缘区域权重降低到5%（从20%降低），非边缘区域保持100%
+            # 诊断：edge_weight=0.2仍导致游离物体，需要更激进
+            edge_weight = torch.where(is_edge, 0.05, 1.0)  # 从0.2降到0.05
+
+            # 应用边缘权重到深度L1 loss
+            depth_l1_pure = (torch.abs((invDepth - mono_invdepth) * depth_mask * edge_weight)).sum() / denom
+            loss_depth_l1 = depth_l1_multiplier * depth_l1_pure
+
+            # 2. 法向一致性loss - 暂时禁用，避免与深度畸变冲突
+            loss_normal = 0.0
+            # # 从渲染深度计算法向
+            # render_normal = depth2normal(invDepth, depth_mask, viewpoint_cam)
+            # # 从单目深度计算法向
+            # mono_normal = depth2normal(mono_invdepth, depth_mask, viewpoint_cam)
+            # # 计算法向余弦相似度 (越接近1越好)
+            # cos_sim = (render_normal * mono_normal).sum(dim=0)  # [H, W]
+            # # 转换为loss：1 - similarity
+            # normal_loss_pure = ((1.0 - cos_sim) * depth_mask).sum() / denom
+            # # 法向loss权重
+            # normal_weight = 0.2
+            # loss_normal = normal_weight * normal_loss_pure
+
+            # 3. 深度平滑loss - 暂时禁用，避免与深度畸变冲突
             loss_smooth = 0.0
+            # lambda_smooth = 0.5 if iteration > 5000 else 0.0
+            # if lambda_smooth > 0:
+            #     depth_render = 1.0 / (invDepth.squeeze(0) + 1e-6)
+            #     grad_x = torch.abs(depth_render[:, 1:] - depth_render[:, :-1])
+            #     grad_y = torch.abs(depth_render[1:, :] - depth_render[:-1, :])
+            #     mask_2d = depth_mask.squeeze(0)
+            #     mask_x = mask_2d[:, 1:] * mask_2d[:, :-1]
+            #     mask_y = mask_2d[1:, :] * mask_2d[:-1, :]
+            #     denom_x = mask_x.sum().clamp(min=1.0)
+            #     denom_y = mask_y.sum().clamp(min=1.0)
+            #     loss_smooth = lambda_smooth * ((grad_x * mask_x).sum() / denom_x + (grad_y * mask_y).sum() / denom_y)
 
-            if lambda_smooth > 0:
-                # 转换逆深度为深度
+            # 4. 深度畸变loss (2DGS方案) - 提高后期权重
+            # 诊断：mean=0.027仍然很高，说明lambda_dist=7.0不够强
+            # 新策略：后期提高到10.0，强制形成薄层
+            if iteration < 1500:
+                lambda_dist = 0.5  # 前1500轮：非常温和，让点云自由探索
+            elif iteration < 5000:
+                lambda_dist = 0.5 + 4.5 * (iteration - 1500) / 3500  # 1500-5000: 0.5→5.0逐渐增加
+            elif iteration < 15000:
+                lambda_dist = 5.0  # 5000-15000: 维持中等强度
+            else:
+                lambda_dist = 10.0  # 15000+: 强制薄层（从7.0提高到10.0）
+
+            loss_depth_dist = 0.0
+            if lambda_dist > 0 and "depth_distortion" in render_pkg:
+                depth_dist = render_pkg["depth_distortion"]
+                depth_mask_2d = depth_mask.squeeze(0)
+
+                # 确保depth_dist是2D (squeeze掉channel维度)
+                depth_dist_2d = depth_dist.squeeze(0) if depth_dist.dim() == 3 else depth_dist
+
+                # 调试：打印depth_distortion的统计信息
+                if iteration % 100 == 0:
+                    valid_dist = depth_dist_2d[depth_mask_2d > 0.5]
+                    print(f"\n[Iter {iteration}] Depth Distortion Stats:")
+                    print(f"  mean={valid_dist.mean().item():.6f}, max={valid_dist.max().item():.6f}")
+                    print(f"  lambda_dist={lambda_dist:.2f}, depth_l1_mult={depth_l1_multiplier:.2f}")
+
+                loss_depth_dist = lambda_dist * (depth_dist_2d * depth_mask_2d).sum() / denom
+
+            # 5. 深度中值约束 - 禁用（会导致loss爆炸和点云崩溃）
+            # BUG诊断：在5000+轮时median loss爆炸到200万，导致点数从几十万暴跌到158
+            lambda_median = 0.0  # 完全禁用
+
+            loss_depth_median = 0.0
+            if lambda_median > 0:
                 depth_render = 1.0 / (invDepth.squeeze(0) + 1e-6)
+                mono_depth = 1.0 / (mono_invdepth.squeeze(0) + 1e-6)
+                valid_mask = (depth_mask.squeeze(0) > 0.5)
 
-                # 计算深度梯度（水平和垂直方向）
-                # 如果存在离散点云，深度会有突变，梯度会很大
-                grad_x = torch.abs(depth_render[:, 1:] - depth_render[:, :-1])  # [H, W-1]
-                grad_y = torch.abs(depth_render[1:, :] - depth_render[:-1, :])  # [H-1, W]
+                if valid_mask.sum() > 100:
+                    render_depth_valid = depth_render[valid_mask]
+                    gt_depth_valid = mono_depth[valid_mask]
+                    render_median = torch.median(render_depth_valid)
+                    gt_median = torch.median(gt_depth_valid)
+                    loss_depth_median = lambda_median * torch.abs(render_median - gt_median)
 
-                # 只在mask有效的相邻区域计算
-                mask_2d = depth_mask.squeeze(0)
-                mask_x = mask_2d[:, 1:] * mask_2d[:, :-1]  # 相邻像素都有效
-                mask_y = mask_2d[1:, :] * mask_2d[:-1, :]
+            # 6. 深度硬约束：强制惩罚偏离GT过远的深度（激进��案）
+            # 原理：如果深度偏离GT超过阈值（如10cm），给予额外惩罚
+            #      这可以防止点云整体偏移太远
+            # 注意：这可能过于rigid，如果GT深度本身有误差，会导致artifacts
+            loss_depth_hard = 0.0
+            # lambda_hard = 5.0 if iteration > 5000 else 0.0  # 5000轮后启用，给模型足够时间先收敛
 
-                # 计算有效区域的梯度均值
-                denom_x = mask_x.sum().clamp(min=1.0)
-                denom_y = mask_y.sum().clamp(min=1.0)
+            # if lambda_hard > 0:
+            #     # 转换逆深度为深度（如果还没转换）
+            #     if not lambda_median > 0:  # 避免重复计算
+            #         depth_render = 1.0 / (invDepth.squeeze(0) + 1e-6)
+            #         mono_depth = 1.0 / (mono_invdepth.squeeze(0) + 1e-6)
 
-                loss_smooth = lambda_smooth * (
-                    (grad_x * mask_x).sum() / denom_x +
-                    (grad_y * mask_y).sum() / denom_y
-                )
+            #     # 计算深度偏差
+            #     depth_error = torch.abs(depth_render - mono_depth)
 
-            # 总loss = 深度loss + 法向loss + 平滑loss
-            loss = loss + loss_depth_l1 + loss_normal + loss_smooth
+            #     # 硬约束阈值：超过10cm的部分给予额外惩罚
+            #     max_deviation = 0.1  # 10cm
+            #     outlier_penalty = torch.clamp(depth_error - max_deviation, min=0.0)
+
+            #     # 只在mask有效区域计算
+            #     depth_mask_2d = depth_mask.squeeze(0)
+            #     loss_depth_hard = lambda_hard * (outlier_penalty * depth_mask_2d).sum() / denom
+
+            # 总loss = 深度loss + 法向loss + 平滑loss + 深度畸变loss + 深度中值loss + 深度硬约束loss
+            loss = loss + loss_depth_l1 + loss_normal + loss_smooth + loss_depth_dist + loss_depth_median + loss_depth_hard
 
         loss.backward()
 
@@ -249,11 +344,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # 处理平滑loss
             smooth_loss_value = loss_smooth.item() if isinstance(loss_smooth, torch.Tensor) else loss_smooth
 
+            # 处理深度畸变loss
+            dist_loss_value = loss_depth_dist.item() if isinstance(loss_depth_dist, torch.Tensor) else loss_depth_dist
+
+            # 处理深度中值loss
+            median_loss_value = loss_depth_median.item() if isinstance(loss_depth_median, torch.Tensor) else loss_depth_median
+
+            # 处理深度硬约束loss
+            hard_loss_value = loss_depth_hard.item() if isinstance(loss_depth_hard, torch.Tensor) else loss_depth_hard
+
             if iteration % 10 == 0:
                 postfix_dict = {
                     "Loss": f"{ema_loss_for_log:.{7}f}",
                     "Depth": f"{ema_Ll1depth_for_log:.{7}f}",
-                    "Smooth": f"{smooth_loss_value:.{5}f}"
+                    "Dist": f"{dist_loss_value:.{5}f}",
+                    "Median": f"{median_loss_value:.{5}f}",
+                    "Hard": f"{hard_loss_value:.{5}f}"
                 }
                 progress_bar.set_postfix(postfix_dict)
                 progress_bar.update(10)
@@ -280,6 +386,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     if dataset.depth_mask_dir != "":
                         valid_region_mask = compute_mask_constraint(gaussians, scene, render, pipe, background)
 
+                    # 使用标准3DGS pruning - 让depth_distortion loss自然工作
+                    # 不再手动设置aggressive threshold
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii, valid_region_mask)
 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
