@@ -94,8 +94,8 @@ class OptimizationParams(ParamGroup):
         self.densify_from_iter = 1500  # 延迟开始，给depth distortion loss时间建立薄表面
         self.densify_until_iter = 10_000  # 从7000改为10000：延长densification，防止点数过早崩溃
         self.densify_grad_threshold = 0.015  # 从0.01提高到0.015：更严格，减少densification
-        self.depth_l1_weight_init = 10.0  # 提高初始权重，增强深度约束
-        self.depth_l1_weight_final = 1.0  # 保持较高的最终权重
+        self.depth_l1_weight_init = 2.0  # 降低初始权重，避免针刺artifact
+        self.depth_l1_weight_final = 0.5  # 降低最终权重
         self.random_background = False
         self.optimizer_type = "default"
         super().__init__(parser, "Optimization Parameters")

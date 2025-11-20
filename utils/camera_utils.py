@@ -61,10 +61,10 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
                     print(f"[Warn] invdepth not found or unreadable: '{cam_info.depth_path}'. Skip this view's depth.")
                     invdepthmap = None
                 else:
-                    # 深度图存储的是真实深度值（单位：毫米）
+                    # TUM深度图存储格式：depth_value / 5000.0 = depth in meters
                     # 需要转换为逆深度（单位：1/米）
                     depth_mm = raw.astype(np.float32)
-                    depth_m = depth_mm / 1000.0  # 毫米转米
+                    depth_m = depth_mm / 5000.0  # TUM depth单位转换: depth_value / 5000.0 = meters
 
                     # 转换为逆深度（invdepth = 1 / depth）
                     # 注意：需要处理depth=0的情况
@@ -116,6 +116,22 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
                     if m.max() > 1.0:
                         m = m / 255.0 if m.max() <= 255.0 else m / 65535.0
                     m = cv2.resize(m, (resolution[0], resolution[1]),interpolation=cv2.INTER_NEAREST)
+
+                    # **关键修复**: Cabinet mask可能包含深度无效的像素（如SAM2基于RGB生成的mask）
+                    # 必须与invdepthmap的有效性做AND操作，避免depth=0导致逆深度爆炸
+                    if invdepthmap is not None:
+                        # invdepthmap此时是2D numpy array [H_orig, W_orig]，需要先resize到mask的分辨率
+                        invdepth_resized = cv2.resize(invdepthmap, (resolution[0], resolution[1]), interpolation=cv2.INTER_LINEAR)
+
+                        # 有效深度处invdepth>0
+                        invdepth_valid = (invdepth_resized > 1e-6).astype(np.float32)  # [H, W]
+                        original_mask_count = (m > 0.5).sum()
+                        m = m * invdepth_valid  # 只保留深度有效的mask区域
+                        filtered_mask_count = (m > 0.5).sum()
+                        num_removed = int(original_mask_count - filtered_mask_count)
+                        if num_removed > 0:
+                            print(f"[Info] {cam_info.image_name}: Filtered {num_removed} invalid depth pixels from cabinet mask")
+
                     depth_mask = m[None]
     except Exception as e:
         print(f"[Warn] depth_mask load failed for {cam_info.image_name}: {e}")

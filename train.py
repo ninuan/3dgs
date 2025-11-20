@@ -187,46 +187,133 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             valid = (depth_mask > 0.5).float()
             denom = valid.sum().clamp(min=1.0)
 
-            # 1. 深度L1损失 - 调整权重平衡
-            # BUG诊断：depth_l1_mult=0.2太低 → 点云缺乏GT约束 → 配合median loss bug导致崩溃
-            # 新策略：提高最低权重，提供足够的稳定性
-            if iteration < 5000:
-                depth_l1_multiplier = 0.5  # 从0.2提高到0.5，提供更多约束
-            elif iteration < 15000:
-                depth_l1_multiplier = 0.5 + 0.5 * (iteration - 5000) / 10000  # 0.5→1.0
+            # === 方案B：Uncertainty-Weighted Depth Loss (鲁棒泛化方案) ===
+            # 原理：根据深度图的局部不确定性自适应调整权重
+            #      - 低不确定性区域（物体表面）→ 高权重（强GT约束）
+            #      - 高不确定性区域（噪声/边缘）→ 低权重（避免拟合噪声）
+            # 优势：自动适应不同数据集的噪声水平和深度图覆盖率
+
+            mono_depth = 1.0 / (mono_invdepth.squeeze(0) + 1e-6)  # [H, W]
+
+            # 步骤1：计算局部深度不确定性
+            # 使用5x5窗口的局部标准差作为不确定性度量
+            kernel_size = 5
+            padding = kernel_size // 2
+
+            # 快速计算局部均值和方差（使用卷积）
+            # E[X²] - E[X]²
+            depth_sq = mono_depth ** 2
+            depth_mask_2d = depth_mask.squeeze(0)  # [H, W]
+
+            # 创建均匀卷积核
+            conv_kernel = torch.ones(1, 1, kernel_size, kernel_size, device='cuda') / (kernel_size ** 2)
+
+            # 计算局部均值和平方均值
+            depth_padded = torch.nn.functional.pad(mono_depth.unsqueeze(0).unsqueeze(0),
+                                                   (padding, padding, padding, padding), mode='replicate')
+            depth_sq_padded = torch.nn.functional.pad(depth_sq.unsqueeze(0).unsqueeze(0),
+                                                      (padding, padding, padding, padding), mode='replicate')
+
+            local_mean = torch.nn.functional.conv2d(depth_padded, conv_kernel).squeeze()  # [H, W]
+            local_mean_sq = torch.nn.functional.conv2d(depth_sq_padded, conv_kernel).squeeze()  # [H, W]
+
+            # 局部方差 = E[X²] - E[X]²
+            local_var = torch.clamp(local_mean_sq - local_mean ** 2, min=0.0)
+            local_std = torch.sqrt(local_var + 1e-6)  # [H, W]
+
+            # 步骤2：计算uncertainty weight
+            # 使用相对不确定性 (std / mean) 作为权重调节因子
+            # 避免除以接近0的值
+            relative_uncertainty = local_std / (local_mean + 0.1)  # [H, W]
+
+            # 转换为权重：高不确定性→低权重
+            # uncertainty_weight在[0.1, 1.0]范围内
+            # k=5.0控制衰减速度，可根据数据集调整
+            k = 5.0
+            uncertainty_weight = 1.0 / (1.0 + k * relative_uncertainty)  # [H, W]
+            uncertainty_weight = torch.clamp(uncertainty_weight, min=0.1, max=1.0)
+
+            # 步骤3：边缘检测（保留原有逻辑，与uncertainty互补）
+            # 边缘通常高不确定性，但这里用梯度直接检测更准确
+            grad_x = torch.abs(mono_depth[:, 1:] - mono_depth[:, :-1])
+            grad_y = torch.abs(mono_depth[1:, :] - mono_depth[:-1, :])
+            grad_x = torch.nn.functional.pad(grad_x, (0, 1), value=0)
+            grad_y = torch.nn.functional.pad(grad_y, (0, 0, 0, 1), value=0)
+            depth_gradient = torch.maximum(grad_x, grad_y)
+
+            # 自适应边缘阈值：根据梯度分布的85th百分位
+            valid_gradients = depth_gradient[depth_mask_2d > 0.5]
+            if valid_gradients.numel() > 100:
+                edge_threshold = torch.quantile(valid_gradients, 0.85)  # 85th百分位
+                edge_threshold = torch.clamp(edge_threshold, min=0.01, max=0.10)
             else:
-                depth_l1_multiplier = 1.0  # 维持1.0（从0.5提高）
+                edge_threshold = 0.05
 
-            # === 边缘自适应权重：降低边缘区域的深度L1权重 ===
-            # 原因：深度相机在边缘有系统性误差（飞点、边缘模糊）
-            # 策略：检测深度梯度大的区域（边缘），降低这些区域的loss权重
-            mono_depth = 1.0 / (mono_invdepth.squeeze(0) + 1e-6)
+            is_edge = (depth_gradient > edge_threshold)  # [H, W]
 
-            # 计算深度梯度（水平和垂直方向）
-            grad_x = torch.abs(mono_depth[:, 1:] - mono_depth[:, :-1])  # [H, W-1]
-            grad_y = torch.abs(mono_depth[1:, :] - mono_depth[:-1, :])  # [H-1, W]
+            # 边缘权重：早期温和(0.3)，后期激进(0.1)
+            if iteration < 5000:
+                edge_weight_low = 0.3
+            else:
+                edge_weight_low = 0.1
+            edge_weight = torch.where(is_edge, edge_weight_low, 1.0)  # [H, W]
 
-            # Pad回原始尺寸
-            grad_x = torch.nn.functional.pad(grad_x, (0, 1), value=0)  # [H, W]
-            grad_y = torch.nn.functional.pad(grad_y, (0, 0, 0, 1), value=0)  # [H, W]
+            # 步骤4：组合uncertainty weight和edge weight
+            # 两种权重相乘：uncertainty处理噪声，edge处理边界artifact
+            combined_weight = uncertainty_weight * edge_weight  # [H, W]
 
-            # 取最大梯度作为边缘指示
-            depth_gradient = torch.maximum(grad_x, grad_y)  # [H, W]
+            # 步骤5：基础权重调度（保持渐进增强）
+            # **修复**: base_multiplier应该被depth_l1_weight(iteration)替代
+            # depth_l1_weight是全局可配置的权重调度（从2.0衰减到0.5）
+            # base_multiplier是硬编码的增长调度（1.0→2.0），两者冲突
+            #
+            # 解决方案：移除base_multiplier，直接使用depth_l1_weight
+            # if iteration < 5000:
+            #     base_multiplier = 1.0  # 早期：中等强度，让点云探索
+            # elif iteration < 15000:
+            #     base_multiplier = 1.0 + 1.0 * (iteration - 5000) / 10000  # 5000-15000: 1.0→2.0
+            # else:
+            #     base_multiplier = 2.0  # 后期：高强度，强制收敛
 
-            # 边缘检测：梯度 > 0.1米（10cm）认为是边缘
-            # 可以根据实际情况调整这个阈值：
-            # - 如果边缘artifact很严重，降低到0.05
-            # - 如果删除太多，提高到0.15
-            edge_threshold = 0.08  # 从0.1降低到0.08，更早检测边缘
-            is_edge = (depth_gradient > edge_threshold).unsqueeze(0)  # [1, H, W]
+            # 步骤6：计算最终depth L1 loss
+            render_depth = 1.0 / (invDepth.squeeze(0) + 1e-6)  # [H, W]
+            depth_diff = torch.abs(render_depth - mono_depth)  # [H, W]
 
-            # 边缘区域权重降低到5%（从20%降低），非边缘区域保持100%
-            # 诊断：edge_weight=0.2仍导致游离物体，需要更激进
-            edge_weight = torch.where(is_edge, 0.05, 1.0)  # 从0.2降到0.05
+            # 应用combined weight
+            weighted_depth_diff = depth_diff * combined_weight * depth_mask_2d  # [H, W]
 
-            # 应用边缘权重到深度L1 loss
-            depth_l1_pure = (torch.abs((invDepth - mono_invdepth) * depth_mask * edge_weight)).sum() / denom
-            loss_depth_l1 = depth_l1_multiplier * depth_l1_pure
+            # **BUG修复**: 应用depth_l1_weight，而不是硬编码的base_multiplier
+            # depth_l1_weight从2.0衰减到0.5（可配置）
+            # 同时归一化：除以有效像素数，使loss scale与图像分辨率无关
+            loss_depth_l1 = depth_l1_weight(iteration) * weighted_depth_diff.sum() / denom
+
+            # **用户建议：Background Opacity Suppression Loss**
+            # **关键修复：惩罚invDepth（逆深度），而不是depth**
+            # 原理：
+            #   - invDepth = 1/depth，当depth→∞时，invDepth→0
+            #   - 惩罚invDepth让背景趋向无穷远（正确）
+            #   - 惩罚depth会让背景趋向0（错误！会把点拉向相机）
+            background_mask = 1.0 - depth_mask_2d  # mask外的区域 [H, W]
+            background_pixels = background_mask.sum().clamp(min=1.0)
+
+            # 正确的loss：惩罚mask外的invDepth（让背景远离/消失）
+            invDepth_2d = invDepth.squeeze(0)  # [H, W]
+            loss_background_suppression = (invDepth_2d * background_mask).sum() / background_pixels
+
+            # 权重：全程保持稳定
+            lambda_bg = 1.0
+            loss_background_suppression = lambda_bg * loss_background_suppression
+            loss_depth_l1 = loss_depth_l1 + loss_background_suppression
+
+            # 调试输出：监控background suppression
+            if iteration % 100 == 0:
+                valid_uncertainty = relative_uncertainty[depth_mask_2d > 0.5]
+                valid_weight = combined_weight[depth_mask_2d > 0.5]
+                bg_invdepth_mean = (invDepth_2d * background_mask).sum() / background_pixels
+                print(f"  Uncertainty: mean={valid_uncertainty.mean().item():.4f}, "
+                      f"weight_mean={valid_weight.mean().item():.3f}, "
+                      f"edge_thresh={edge_threshold:.4f}")
+                print(f"  Background suppression: bg_invdepth_mean={bg_invdepth_mean.item():.6f}, lambda_bg={lambda_bg:.2f}")
 
             # 2. 法向一致性loss - 暂时禁用，避免与深度畸变冲突
             loss_normal = 0.0
@@ -280,8 +367,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration % 100 == 0:
                     valid_dist = depth_dist_2d[depth_mask_2d > 0.5]
                     print(f"\n[Iter {iteration}] Depth Distortion Stats:")
-                    print(f"  mean={valid_dist.mean().item():.6f}, max={valid_dist.max().item():.6f}")
-                    print(f"  lambda_dist={lambda_dist:.2f}, depth_l1_mult={depth_l1_multiplier:.2f}")
+                    if valid_dist.numel() > 0:
+                        print(f"  mean={valid_dist.mean().item():.6f}, max={valid_dist.max().item():.6f}")
+                    else:
+                        print(f"  No valid pixels in depth mask!")
+                    print(f"  lambda_dist={lambda_dist:.2f}, depth_l1_weight={depth_l1_weight(iteration):.2f}")
 
                 loss_depth_dist = lambda_dist * (depth_dist_2d * depth_mask_2d).sum() / denom
 
@@ -326,8 +416,65 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             #     depth_mask_2d = depth_mask.squeeze(0)
             #     loss_depth_hard = lambda_hard * (outlier_penalty * depth_mask_2d).sum() / denom
 
-            # 总loss = 深度loss + 法向loss + 平滑loss + 深度畸变loss + 深度中值loss + 深度硬约束loss
-            loss = loss + loss_depth_l1 + loss_normal + loss_smooth + loss_depth_dist + loss_depth_median + loss_depth_hard
+            # 7. Scale Regularization - 防止高斯椭球过度拉伸（基于2024年文献）
+            # 原理：惩罚过大的scale，保持高斯在合理尺寸范围内
+            # 参考：Depth-Regularized 3DGS (CVPR 2024), Pixel-GS (ECCV 2024)
+            loss_scale_reg = 0.0
+            if iteration > 500:  # 前500轮让点云自由初始化
+                scales = gaussians.get_scaling  # [N, 3]
+
+                # 方法1：L2惩罚大scale
+                # 惩罚超过场景尺度10%的高斯
+                scene_scale = scene.cameras_extent
+                max_allowed_scale = 0.1 * scene_scale
+                scale_penalty = torch.clamp(scales - max_allowed_scale, min=0.0)
+
+                # 渐进权重调度
+                if iteration < 5000:
+                    lambda_scale = 0.01  # 早期：轻微约束
+                elif iteration < 15000:
+                    lambda_scale = 0.05  # 中期：中等约束
+                else:
+                    lambda_scale = 0.1   # 后期：强约束
+
+                loss_scale_reg = lambda_scale * (scale_penalty ** 2).mean()
+
+            # 8. Anisotropy Penalty - 防止"针刺"形状（基于2024年文献）
+            # 原理：惩罚三个scale轴比例失衡（如1:1:100这种针状）
+            # 参考：FreGS (CVPR 2024), SuGaR (CVPR 2024)
+            loss_anisotropy = 0.0
+            if iteration > 500:
+                scales = gaussians.get_scaling  # [N, 3]
+
+                # 计算各向异性比率：max_scale / min_scale
+                # 理想的盘状或球状高斯比率应该 < 10
+                max_scale = scales.max(dim=1)[0]  # [N]
+                min_scale = scales.min(dim=1)[0]  # [N]
+                anisotropy_ratio = max_scale / (min_scale + 1e-6)
+
+                # 惩罚比率 > 10 的高斯（允许一定拉伸，但不能太极端）
+                max_allowed_ratio = 10.0
+                anisotropy_penalty = torch.clamp(anisotropy_ratio - max_allowed_ratio, min=0.0)
+
+                # 渐进权重调度
+                if iteration < 5000:
+                    lambda_aniso = 0.01
+                elif iteration < 15000:
+                    lambda_aniso = 0.05
+                else:
+                    lambda_aniso = 0.1
+
+                loss_anisotropy = lambda_aniso * anisotropy_penalty.mean()
+
+                # 调试输出
+                if iteration % 100 == 0:
+                    print(f"  Scale: mean={scales.mean().item():.4f}, max={scales.max().item():.4f}")
+                    print(f"  Anisotropy: mean_ratio={anisotropy_ratio.mean().item():.2f}, "
+                          f"max_ratio={anisotropy_ratio.max().item():.2f}, "
+                          f"num_needles={(anisotropy_ratio > 20).sum().item()}")
+
+            # 总loss = RGB loss + 深度loss + 法向loss + 平滑loss + 深度畸变loss + 深度中值loss + 深度硬约束loss + scale正则 + 各向异性惩罚
+            loss = loss + loss_depth_l1 + loss_normal + loss_smooth + loss_depth_dist + loss_depth_median + loss_depth_hard + loss_scale_reg + loss_anisotropy
 
         loss.backward()
 
@@ -392,6 +539,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
+            else:
+                # **关键修复**: Densification结束后，继续定期执行mask-based pruning
+                # 删除mask外的点，防止散点残留
+                # 频率：每100 iter执行一次（比densification期间更频繁）
+                if dataset.depth_mask_dir != "" and iteration % 100 == 0:
+                    print(f"\n[Iter {iteration}] Post-densification mask pruning...")
+                    valid_region_mask = compute_mask_constraint(gaussians, scene, render, pipe, background)
+
+                    if valid_region_mask is not None:
+                        # 只做mask pruning，不做densification
+                        outside_mask = ~valid_region_mask
+                        num_outside = outside_mask.sum().item()
+
+                        if num_outside > 0:
+                            print(f"  Removing {num_outside} points outside mask region")
+
+                            # **修复**: prune_points需要tmp_radii，但在post-densification期间它是None
+                            # 临时初始化tmp_radii为全0（反正不会用到）
+                            if gaussians.tmp_radii is None:
+                                gaussians.tmp_radii = torch.zeros(gaussians.get_xyz.shape[0], device="cuda")
+
+                            gaussians.prune_points(outside_mask)
+                            print(f"  Remaining points: {gaussians.get_xyz.shape[0]}")
 
             # Optimizer step
             if iteration < opt.iterations:

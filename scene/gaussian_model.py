@@ -470,10 +470,52 @@ class GaussianModel:
         # 记录densification前的点数，用于后续mask约束
         num_points_before = self.get_xyz.shape[0]
 
+        # === 扩展valid_region_mask以匹配densification后的点数 ===
+        # 1. Clone操作：记录哪些点会被克隆
+        if valid_region_mask is not None:
+            # Clone: 计算会被克隆的点
+            clone_mask = torch.where(torch.norm(grads, dim=-1) >= max_grad, True, False)
+            clone_mask = torch.logical_and(clone_mask,
+                                          torch.max(self.get_scaling, dim=1).values <= self.percent_dense*extent)
+            clone_mask = torch.logical_and(clone_mask, valid_region_mask)
+
+            # Split: 计算会被分裂的点
+            padded_grad = torch.zeros((num_points_before), device="cuda")
+            padded_grad[:grads.shape[0]] = grads.squeeze()
+            split_mask = torch.where(padded_grad >= max_grad, True, False)
+            split_mask = torch.logical_and(split_mask,
+                                          torch.max(self.get_scaling, dim=1).values > self.percent_dense*extent)
+
         self.densify_and_clone(grads, max_grad, extent, valid_region_mask)
         self.densify_and_split(grads, max_grad, extent)
 
-        # === 标准3DGS Pruning + 温和的scale约束 ===
+        # 2. 扩展valid_region_mask以包含新创建的点
+        if valid_region_mask is not None:
+            # Clone产生的新点：继承父点的mask validity（已经被valid_region_mask过滤）
+            # 所有被克隆的点都是valid的（因为clone_mask已经与valid_region_mask做了AND）
+            new_mask_from_clone = torch.ones(clone_mask.sum(), device="cuda", dtype=torch.bool)
+
+            # Split产生的新点：继承父点的mask validity
+            # Split产生N=2个新点，然后删除原点，所以净增加N-1=1个点
+            # 新点继承父点的validity
+            num_split_points = split_mask.sum().item()
+            new_mask_from_split = valid_region_mask[split_mask]  # 继承父点的validity
+
+            # 扩展mask：原始点 + clone新点 + split新点
+            # 注意：split会删除原点，所以最终大小 = num_points_before - num_split + 2*num_split + num_clone
+            #                                      = num_points_before + num_split + num_clone
+            valid_region_mask = torch.cat([
+                valid_region_mask,           # 原始点（包括会被split删除的点）
+                new_mask_from_clone,         # clone新增的点
+                new_mask_from_split.repeat(2) # split新增的2个点/每个父点
+            ])
+
+            # Split操作会删除原始被split的点，需要移除这些点的mask
+            # 创建一个prune_filter来标记被删除的点
+            split_prune_filter = torch.cat((split_mask, torch.zeros(clone_mask.sum() + 2 * num_split_points, device="cuda", dtype=bool)))
+            valid_region_mask = valid_region_mask[~split_prune_filter]
+
+        # === 标准3DGS Pruning + 激进的针刺pruning（2024方案） ===
         # 只保留基础的opacity pruning，让depth_distortion loss自然工作
         prune_mask = (self.get_opacity < min_opacity).squeeze()
 
@@ -487,6 +529,37 @@ class GaussianModel:
         # 使用0.15 * extent（比标准0.1宽松，但能删除最极端的情况）
         very_large_gaussians = self.get_scaling.max(dim=1).values > 0.15 * extent
         prune_mask = torch.logical_or(prune_mask, very_large_gaussians)
+
+        # === 新增：Anisotropy-based Pruning（针对"针刺"artifact）===
+        # 参考：Pixel-GS (ECCV 2024), FreGS (CVPR 2024)
+        # 原理：删除各向异性比率过高的高斯（needle-like shapes）
+        scales = self.get_scaling  # [N, 3]
+        max_scale = scales.max(dim=1)[0]  # [N]
+        min_scale = scales.min(dim=1)[0]  # [N]
+        anisotropy_ratio = max_scale / (min_scale + 1e-6)
+
+        # 删除���率 > 20 的极端针刺状高斯
+        needle_gaussians = anisotropy_ratio > 20.0
+        prune_mask = torch.logical_or(prune_mask, needle_gaussians)
+
+        num_needles = needle_gaussians.sum().item()
+        if num_needles > 0:
+            print(f"[Anisotropy Pruning] Removing {num_needles} needle-like Gaussians (ratio > 20)")
+
+        # === 新增：Mask-based Pruning（删除mask外的gaussian）===
+        # 如果提供了valid_region_mask，删除所有不在有效区域内的gaussian
+        if valid_region_mask is not None:
+            # Debug: 验证tensor尺寸匹配
+            num_gaussians = self.get_xyz.shape[0]
+            print(f"[Mask Debug] Gaussians: {num_gaussians}, valid_region_mask size: {valid_region_mask.shape[0]}, prune_mask size: {prune_mask.shape[0]}")
+
+            # valid_region_mask: [N] bool tensor，True表示在mask内
+            outside_mask = ~valid_region_mask
+            prune_mask = torch.logical_or(prune_mask, outside_mask)
+
+            num_outside = outside_mask.sum().item()
+            if num_outside > 0:
+                print(f"[Mask Pruning] Removing {num_outside} Gaussians outside valid region")
 
         self.prune_points(prune_mask)
 
